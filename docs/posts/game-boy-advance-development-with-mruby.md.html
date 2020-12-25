@@ -1,0 +1,571 @@
+<meta charset="utf-8">
+
+**Game Boy Advance development with mruby**
+
+I had been playing around with [mruby](https://github.com/mruby/mruby), and got to wondering whether or not I could run it on a GBA. This was not obvious to me, but it did seem plausible, so I set to find out.
+
+If I can get a C program compiled into a ROM running on a GBA, I can then take a go at embedding mruby inside of that program, and there we go. Of particular interest at this point, I want to mention Yuji Yokoo and his project putting mruby on the Dreamcast! It's very cool and was a source of great inspiration; check out [his work](https://github.com/yujiyokoo/mrbtris-dreamcast)! He's given a few talks about it over the years as well.
+
+Since this post is more about getting ruby running on a GBA rather than GBA development itself, I'm not really going to get into the specifics of GBA development. What I learned, I learned from [here](https://www.reinterpretcast.com/writing-a-game-boy-advance-game), and it's the same example source code from that post that I'll be using here.
+
+Note: I'm running Ubuntu 20.04, you may need to modify some of what follows to work with your environment.
+
+# Setup GBA toolchain
+
+I first installed the [devkitARM GBA toolchain](https://devkitpro.org/wiki/Getting_Started). Instructions will vary depending on your system. For me, I installed their [devkitPro pacman](https://devkitpro.org/wiki/devkitPro_pacman) deb package. On my system, it put most everything in `/opt/devkitpro` which was fine with me. I also got an `/etc/profile.d/devkit-env.sh` script which sets a couple of paths. I'm going to use a Makefile to automate the build and everything, so I won't have my shell files source any of that by default.
+
+I like to use a Makefile to automate from the start. They're usually copypastable between projects which is very convenient for current and future me, and it makes returning to projects after I've forgotten everything much easier.
+
+Here's the one I'm using for now.
+
+~~~
+#
+# Project
+#
+BUILD_DIR = build
+
+SRC_DIR = src
+SRCS = main.c
+OBJS = $(SRCS:.c=.o)
+
+all: gba_release gba_debug
+
+test: vba_release vba_debug
+
+clean:
+	rm -r $(BUILD_DIR)
+
+.PHONY: all test clean
+
+# Make `source` command available.
+SHELL := /bin/bash
+# Set the paths to the gba toolchain binaries
+ENV := source /etc/profile.d/devkit-env.sh && export PATH=/opt/devkitpro/devkitARM/bin:$$PATH
+CC := $(ENV) && arm-none-eabi-g++
+OBJCOPY := $(ENV) && arm-none-eabi-objcopy
+LDLIBS = -lm -lgba
+LDFLAGS = -mthumb-interwork -mthumb -specs=gba.specs \
+					-L /opt/devkitpro/libgba/lib/
+CFLAGS = -std=c++17 \
+				 -pedantic-errors -Wall -Weffc++ -Wextra -Wsign-conversion \
+				 -mthumb-interwork -mthumb \
+				 -isystem /opt/devkitpro/libgba/include
+REL_CFLAGS = -O3 -DNDEBUG
+DBG_CFLAGS = -g -O0 -DNDEBUG=0
+
+#
+# Build Template
+#
+ELF = main.elf
+ROM = main.gba
+define gba_build_template
+$(1)_DIR = $$(BUILD_DIR)/gba_$(2)
+$(1)_ELF = $$($(1)_DIR)/$$(ELF)
+$(1)_ROM = $$($(1)_DIR)/$$(ROM)
+$(1)_OBJS = $$(addprefix $$($(1)_DIR)/, $$(OBJS))
+
+vba_$(2): $$($(1)_ROM)
+	vba $$<
+
+gba_$(2): $$($(1)_ROM)
+
+.PHONY: vba_$(2) gba_$(2)
+
+$$($(1)_ROM): $$($(1)_ELF)
+	$$(OBJCOPY) -v -O binary $$< $$@ && gbafix $$@
+
+$$($(1)_ELF): $$($(1)_OBJS)
+	$$(CC) $$(LDFLAGS) $$($(1)_OBJS) $$(LDLIBS) -o $$@
+
+$$($(1)_DIR)/%.o: $$(SRC_DIR)/%.c | $$($(1)_DIR)
+	$$(CC) -c $$(CFLAGS) $$($(1)_CFLAGS) -o $$@ $$<
+
+$$($(1)_DIR)/%.o: | $$($(1)_DIR)
+	$$(CC) -c $$(CFLAGS) $$(CFLAGS) $$($(1)_CFLAGS) -o $$@ $$<
+
+$$($(1)_DIR):
+	mkdir -p $$@
+
+endef
+
+#
+# Builds
+#
+$(eval $(call gba_build_template,DBG,debug))
+$(eval $(call gba_build_template,REL,release))
+
+info:
+	$(info $(call gba_build_template,DBG,debug))
+	$(info $(call gba_build_template,REL,release))
+
+.PHONY: gba_info
+~~~
+
+Put this in `src/main.c`:
+
+~~~
+// src/main.c
+int main(void) {
+  // Write into the I/O registers, setting video display parameters.
+  volatile unsigned char *ioram = (unsigned char *)0x04000000;
+  ioram[0] = 0x03; // Use video mode 3 (in BG2, a 16bpp bitmap in VRAM)
+  ioram[1] = 0x04; // Enable BG2 (BG0 = 1, BG1 = 2, BG2 = 4, ...)
+
+  // Write pixel colours into VRAM
+  volatile unsigned short *vram = (unsigned short *)0x06000000;
+  vram[80 * 240 + 115] = 0x001F; // X = 115, Y = 80, C = 000000000011111 = R
+  vram[80 * 240 + 120] = 0x03E0; // X = 120, Y = 80, C = 000001111100000 = G
+  vram[80 * 240 + 125] = 0x7C00; // X = 125, Y = 80, C = 111110000000000 = B
+
+  // Wait forever
+  while (1) {
+  };
+
+  return 0;
+}
+~~~
+
+Let's try to compile our ROM; we should see all of our steps execute successfully, and then my emulator will run the ROM.
+
+~~~
+$ make vba_release
+source /etc/profile.d/devkit-env.sh && export PATH=/opt/devkitpro/devkitARM/bin:$PATH && arm-none-eabi-g++ -c -std=c++17 -pedantic-errors -Wall -Weffc++ -Wextra -Wsign-conversion -mthumb-interwork -mthumb -isystem /opt/devkitpro/libgba/include -O3 -DNDEBUG -o build/gba_release/main.o src/main.c
+source /etc/profile.d/devkit-env.sh && export PATH=/opt/devkitpro/devkitARM/bin:$PATH && arm-none-eabi-g++ -mthumb-interwork -mthumb -specs=gba.specs -L /opt/devkitpro/libgba/lib/ build/gba_release/main.o -lm -lgba -o build/gba_release/main.elf
+source /etc/profile.d/devkit-env.sh && export PATH=/opt/devkitpro/devkitARM/bin:$PATH && arm-none-eabi-objcopy -v -O binary build/gba_release/main.elf build/gba_release/main.gba && gbafix build/gba_release/main.gba
+copy from `build/gba_release/main.elf' [elf32-littlearm] to `build/gba_release/main.gba' [binary]
+ROM fixed!
+~~~
+
+![first_rom.png](game-boy-advance-development-with-mruby/first_rom.png)
+
+[Link to the code](https://github.com/boatrite/gba-mruby-demo/commit/01-bootstrap-environment)
+
+# Cross compile mruby for GBA
+
+We're going to automatically download dependencies to `vendor/` and don't want them checked in.
+
+~~~
+$ echo vendor >> .gitignore
+~~~
+
+Update our Makefile to download mruby. Yeah, this probably isn't idiomatic Makefile or dependency management, but it works well enough.
+
+~~~
+#
+# Vendor
+#
+vendor_clean:
+	rm -r vendor
+
+.PHONY: vendor_clean
+
+# | means an "order-only" prerequisite. Basically it lets me use a directory as
+# a dependency in a way that doesn't cause extra rebuilds.
+# https://stackoverflow.com/a/4481931
+# https://www.gnu.org/software/make/manual/make.html#Prerequisite-Types
+vendor/mruby-2.1.1/build/gameboyadvance/lib/libmruby.a: mruby_build_config.rb | vendor/mruby-2.1.1
+	cd ./vendor/mruby-2.1.1 && rake
+
+vendor/mruby-2.1.1: vendor/mruby-2.1.1.zip
+	unzip ./vendor/mruby-2.1.1.zip -d ./vendor/
+	rm ./vendor/mruby-2.1.1/build_config.rb
+	cd ./vendor/mruby-2.1.1 && ln -s ../../mruby_build_config.rb build_config.rb
+
+vendor/mruby-2.1.1.zip: | vendor
+	wget -O ./vendor/mruby-2.1.1.zip https://github.com/mruby/mruby/archive/2.1.1.zip
+
+vendor:
+	mkdir -p vendor
+~~~
+
+Since we're cross compiling from our current machines into something the GBA processor can run, we need to modify the `build_config.rb` file that comes with mruby (`vendor/mruby-2.1.1/build_config.rb`).
+
+However, there's two things. One, I don't want to mix our custom build config with our clean download. Two, everything in vendor is gitignored, but we want to check in our build config to source control. So I'm going to have a `mruby_build_config.rb` file in the root of the project, the Makefile will automatically replace the default `build_config.rb` with a symlink to ours.
+
+Using the examples [here](https://github.com/mruby/mruby/tree/master/build_config) as a guide, this is what I came up with:
+
+~~~
+# mruby_build_config.rb
+MRuby::Build.new do |conf|
+  # Gets set by the VS command prompts
+  if ENV["VisualStudioVersion"] || ENV["VSINSTALLDIR"]
+    toolchain :visualcpp
+  else
+    toolchain :gcc
+  end
+
+  enable_debug
+
+  # Include the default GEMs
+  conf.gembox "default"
+end
+
+# Cross Compiling configuration for the Nintendo GameBoyAdvance.
+# This configuration requires devkitARM
+# https://devkitpro.org/wiki/Getting_Started/devkitARM
+#
+# Tested only on GNU/Linux
+#
+MRuby::CrossBuild.new("gameboyadvance") do |conf|
+  toolchain :gcc
+
+  DEVKITPRO_PATH = "/opt/devkitpro"
+  BIN_PATH = "#{DEVKITPRO_PATH}/devkitARM/bin"
+
+  # C compiler
+  conf.cc do |cc|
+    cc.command = "#{BIN_PATH}/arm-none-eabi-gcc"
+    cc.flags << ["-mthumb-interwork", "-mthumb", "-O2"]
+    cc.compile_options = %(%{flags} -o "%{outfile}" -c "%{infile}")
+  end
+
+  # C++ compiler
+  conf.cxx do |cxx|
+    cxx.command = "#{BIN_PATH}/arm-none-eabi-g++"
+    cxx.include_paths = conf.cc.include_paths.dup
+    cxx.flags = conf.cc.flags.dup
+    cxx.flags << %w[-fno-rtti -fno-exceptions]
+    cxx.defines = conf.cc.defines.dup
+    cxx.compile_options = conf.cc.compile_options.dup
+  end
+
+  # Linker
+  conf.linker do |linker|
+    linker.command = "#{BIN_PATH}/arm-none-eabi-gcc"
+    linker.flags << ["-mthumb-interwork", "-mthumb", "-specs=gba.specs"]
+  end
+
+  # No executables
+  conf.bins = []
+
+  # Do not build executable test
+  conf.build_mrbtest_lib_only
+
+  # Disable C++ exception
+  conf.disable_cxx_exception
+
+  # Gems from core
+  # removing mruby-io
+  conf.gem core: "mruby-metaprog"
+  conf.gem core: "mruby-pack"
+  conf.gem core: "mruby-sprintf"
+  conf.gem core: "mruby-print"
+  conf.gem core: "mruby-math"
+  conf.gem core: "mruby-time"
+  conf.gem core: "mruby-struct"
+  conf.gem core: "mruby-compar-ext"
+  conf.gem core: "mruby-enum-ext"
+  conf.gem core: "mruby-string-ext"
+  conf.gem core: "mruby-numeric-ext"
+  conf.gem core: "mruby-array-ext"
+  conf.gem core: "mruby-hash-ext"
+  conf.gem core: "mruby-range-ext"
+  conf.gem core: "mruby-proc-ext"
+  conf.gem core: "mruby-symbol-ext"
+  conf.gem core: "mruby-random"
+  conf.gem core: "mruby-object-ext"
+  conf.gem core: "mruby-objectspace"
+  conf.gem core: "mruby-fiber"
+  conf.gem core: "mruby-enumerator"
+  conf.gem core: "mruby-enum-lazy"
+  conf.gem core: "mruby-toplevel-ext"
+  conf.gem core: "mruby-kernel-ext"
+  conf.gem core: "mruby-class-ext"
+  conf.gem core: "mruby-compiler"
+end
+~~~
+
+Now to test it all out!
+
+~~~
+$ make vendor_clean
+$ make vendor/mruby-2.1.1
+$ make vendor/mruby-2.1.1/build/gameboyadvance/lib/libmruby.a
+# ... lots of compiling output
+~~~
+
+After compilation has finished, we have a file at `vendor/mruby-2.1.1/build/gameboyadvance/lib/libmruby.a`. Let's sanity check this worked by linking it in, instantiating an mruby VM, and running the ROM.
+
+I updated the Makefile to include the libmruby.a file as a dependency and also made these changes to `main.c`:
+
+~~~
+#include <mruby.h>
+
+mrb_state *new_ruby_vm() {
+  // Start Ruby VM
+  mrb_state *mrb = mrb_open();
+
+  return mrb;
+}
+
+int main(void) {
+  mrb_state *mrb = new_ruby_vm();
+  mrb_close(mrb);
+
+  // Write into the I/O registers, setting video display parameters.
+// ...
+~~~
+
+Now when the ROM is compiled and ran, I get a blank screen for a few seconds while the mruby code executes, then the rest of our demo runs and we get the black screen with three dots again.
+
+![mruby_rom.gif](game-boy-advance-development-with-mruby/mruby_rom.gif)
+
+[Link to the code](https://github.com/boatrite/gba-mruby-demo/tree/02-embed-mruby) / [Link to the diff](https://github.com/boatrite/gba-mruby-demo/compare/01-bootstrap-environment...02-embed-mruby)
+
+# Start demo from Ruby
+
+That was a great start, we have what looks like a ruby VM running in a GBA ROM. But, it didn't really run any ruby code, and that's just not exciting. To get started, we're going to wrap the entire demo in a single C function call which we'll bind to a ruby class method, and then we'll call it from ruby.
+
+I'm also going to update the demo to move the blue dot a bit more to the right, so we can really see that it's our new C-backed ruby code that's doing things. That `125` is now a `145`.
+
+~~~
+// src/main.c
+#include <mruby.h>
+#include <mruby/compile.h>
+
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-parameter"
+mrb_value run_demo(mrb_state *mrb, mrb_value self) {
+  // Write into the I/O registers, setting video display parameters.
+  volatile unsigned char *ioram = (unsigned char *)0x04000000;
+  ioram[0] = 0x03; // Use video mode 3 (in BG2, a 16bpp bitmap in VRAM)
+  ioram[1] = 0x04; // Enable BG2 (BG0 = 1, BG1 = 2, BG2 = 4, ...)
+
+  // Write pixel colours into VRAM
+  volatile unsigned short *vram = (unsigned short *)0x06000000;
+  vram[80 * 240 + 115] = 0x001F; // X = 115, Y = 80, C = 000000000011111 = R
+  vram[80 * 240 + 120] = 0x03E0; // X = 120, Y = 80, C = 000001111100000 = G
+  vram[80 * 240 + 145] = 0x7C00; // X = 125, Y = 80, C = 111110000000000 = B
+}
+#pragma GCC diagnostic pop
+
+mrb_state *new_ruby_vm() {
+  // Start Ruby VM
+  mrb_state *mrb = mrb_open();
+
+  // Define Ruby extensions backed by C
+  struct RClass *GBA_class = mrb_define_class(mrb, "GBA", mrb->object_class);
+
+  mrb_define_class_method(mrb, GBA_class, "run_demo", run_demo, MRB_ARGS_NONE());
+
+  return mrb;
+}
+
+int main(void) {
+  mrb_state *mrb = new_ruby_vm();
+  mrb_load_string(mrb, "GBA.run_demo");
+  mrb_close(mrb);
+
+  // Wait forever
+  while (1) {
+  };
+
+  return 0;
+}
+~~~
+
+Compile and run the ROM to see our slightly modified scene.
+
+![mruby_rom.png](game-boy-advance-development-with-mruby/mruby_rom.png)
+
+[Link to the code](https://github.com/boatrite/gba-mruby-demo/tree/03-run-demo-from-ruby) / [Link to the diff](https://github.com/boatrite/gba-mruby-demo/compare/02-embed-mruby...03-run-demo-from-ruby)
+
+# Test our ruby demo on real GBA hardware
+
+This is the most boring demo, but it's one thing to run a ROM in an emulator, it's an entirely other thing to run that same ROM on an actual Game Boy Advance. And even though my code was a bit more complicated the first time I did this, since it's us doing it now, I want to bring the hardware into the development loop as soon as possible. I want to be able to check that every thing new we do in ruby actually works.
+
+This was by far the most expensive part of this experiment -- the only expense really. The GBA itself was a smooth $90 on Ebay, and the [flash cart](https://shop.insidegadgets.com/product/gba-32mb-1mbit-flash-save-with-rtc-flash-cart-works-with-pokemon-games) and [cart writer](https://shop.insidegadgets.com/product/gbxcart-rw/) which caught my eye cost another $36 and $30 respectively. But the science must be done.
+
+One of the reasons I bought the cart and writer I did was the explicit linux support and tooling, but from what I saw, we need to [compile the program ourselves](https://flashcartdb.com/index.php/GBxCart_RW_Manual#For_Linux.2FMac), so I'm just going to throw together a little automation magic.
+
+~~~
+$ echo flasher > .gitignore # Add new flasher directory to gitignore
+~~~
+
+Makefile changes:
+
+~~~
+#
+# Build Template
+#
+
+# ...
+
+flash_$(2): flasher/config-flash.ini $$($(1)_ROM)
+	cd flasher/ && sudo ./GBxCart_RW_Flasher_v1.37/GBxCart_RW_Console_Flasher_v1.37/gbxcart_rw_flasher_v1.37 ../$$($(1)_ROM)
+
+.PHONY: vba_$(2) gba_$(2) flash_$(2)
+
+# ...
+
+#
+# Flashcart tools
+#
+# Note: flash_release and flash_debug are defined dynamically above which
+# perform the actual flashing.
+#
+flasher_clean:
+	rm -f flasher/config.ini
+	rm -r flasher
+
+.PHONY: flasher_clean
+
+# We need to run the flasher without any arguments once in order to configure it
+flasher/config-flash.ini: flasher/GBxCart_RW_Flasher_v1.37/GBxCart_RW_Console_Flasher_v1.37/gbxcart_rw_flasher_v1.37
+	cd flasher/ && ./GBxCart_RW_Flasher_v1.37/GBxCart_RW_Console_Flasher_v1.37/gbxcart_rw_flasher_v1.37
+
+flasher/GBxCart_RW_Flasher_v1.37/GBxCart_RW_Console_Flasher_v1.37/gbxcart_rw_flasher_v1.37: | flasher/GBxCart_RW_Flasher_v1.37
+	cd flasher/GBxCart_RW_Flasher_v1.37/GBxCart_RW_Console_Flasher_v1.37/ && make
+
+flasher/GBxCart_RW_Flasher_v1.37: flasher/GBxCart_RW_Flasher_v1.37.zip
+	unzip ./flasher/GBxCart_RW_Flasher_v1.37.zip -d ./flasher/
+
+flasher/GBxCart_RW_Flasher_v1.37.zip: | flasher
+	wget -O flasher/GBxCart_RW_Flasher_v1.37.zip https://shop.insidegadgets.com/wp-content/uploads/2018/05/GBxCart_RW_Flasher_v1.37.zip
+
+flasher:
+	mkdir -p flasher
+~~~
+
+I spent a bit of time cleaning this up, and I'm really happy with how it turned out. Type `make flash_release` or `make flash_debug` and make will download the flasher, compile it, prompt you to configure it, build and finally flash the appropriate rom. Type `make flash_release` or `make flash_debug` again and it just flashes the rom.
+
+The result is boring and exciting. Three barely distinguishable dots among all the scratches, but those three dots are there because ruby code was executed on a GBA. Yeaaaah, this is pretty rad.
+
+![rom_on_gba.jpg](game-boy-advance-development-with-mruby/rom_on_gba.jpg)
+
+[Link to the code](https://github.com/boatrite/gba-mruby-demo/tree/04-flash-rom) / [Link to the diff](https://github.com/boatrite/gba-mruby-demo/compare/03-run-demo-from-ruby...04-flash-rom)
+
+# Write code in ruby files
+
+Something notably absent until now is an actual `.rb` file. We'll take a ruby file we want to run and compile it down to an intermediate bytecode which we can embed in our program. This takes the form of a c file which is literally just an array of bytecode. Once we have a single ruby file embeded, we can use that to bootstrap whatever ruby environment we want.
+
+Start with a new file, `scripts/ruby_main.rb`
+
+~~~
+GBA.run_demo
+~~~
+
+and changes to our Makefile
+
+~~~
+#
+# Project
+#
+BUILD_DIR = build
+SCRIPT_DIR = scripts
+SCRIPTS = ruby_main.rb
+SCRIPT_BYTECODE_DIR = $(BUILD_DIR)/bytecode
+
+# ...
+
+SRCS = main.c $(SCRIPTS:.rb=.c)
+
+# ...
+
+#
+# Build Template
+#
+
+# ...
+
+$$($(1)_DIR)/%.o: $$(SCRIPT_BYTECODE_DIR)/%.c | $$($(1)_DIR) vendor/mruby-2.1.1
+	$$(CC) -c $$(CFLAGS) $$($(1)_CFLAGS) -o $$@ $$<
+
+# ...
+
+#
+# Scripting
+#
+$(SCRIPT_BYTECODE_DIR)/%.c: $(SCRIPT_DIR)/%.rb | $(SCRIPT_BYTECODE_DIR)
+	./vendor/mruby-2.1.1/bin/mrbc -B$(patsubst $(SCRIPT_BYTECODE_DIR)/%.c,%,$@) -o $@ $<
+
+# Keep bytecode files after task runs. These are normally deleted since they
+# are identified as intermediary.
+.PRECIOUS: $(SCRIPT_BYTECODE_DIR)/%.c
+
+$(SCRIPT_BYTECODE_DIR):
+	mkdir -p $@
+~~~
+
+Running `make build/bytecode/ruby_main.c` creates the bytecode.
+
+~~~
+/* dumped in little endian order.
+   use `mrbc -E` option for big endian CPU. */
+#include <stdint.h>
+#ifdef __cplusplus
+extern const uint8_t ruby_main[];
+#endif
+const uint8_t
+#if defined __GNUC__
+ __attribute__ ((aligned(4)))
+#elif defined _MSC_VER
+__declspec(align(4))
+#endif
+ruby_main[] = {
+0x45,0x54,0x49,0x52,0x30,0x30,0x30,0x36,0x11,0xb7,0x00,0x00,0x00,0x5b,0x4d,0x41,
+0x54,0x5a,0x30,0x30,0x30,0x30,0x49,0x52,0x45,0x50,0x00,0x00,0x00,0x3d,0x30,0x30,
+0x30,0x32,0x00,0x00,0x00,0x53,0x00,0x01,0x00,0x03,0x00,0x00,0x00,0x00,0x00,0x0a,
+0x1b,0x01,0x00,0x2e,0x01,0x01,0x00,0x37,0x01,0x67,0x00,0x00,0x00,0x00,0x00,0x00,
+0x00,0x02,0x00,0x03,0x47,0x42,0x41,0x00,0x00,0x08,0x72,0x75,0x6e,0x5f,0x64,0x65,
+0x6d,0x6f,0x00,0x45,0x4e,0x44,0x00,0x00,0x00,0x00,0x08,
+};
+~~~
+
+And to actually run it, we modify `src/main.c`:
+
+~~~
+#include <mruby.h>
+#include <mruby/irep.h>
+
+extern const uint8_t ruby_main[];
+
+# ...
+
+mrb_state *new_ruby_vm() {
+  # ...
+
+  // Load in our mruby bytecode
+  mrb_load_irep(mrb, ruby_main);
+
+  return mrb;
+}
+
+int main(void) {
+  mrb_state *mrb = new_ruby_vm();
+  mrb_close(mrb);
+
+  // Wait forever
+  while (1) {
+  };
+
+  return 0;
+}
+~~~
+
+I'm also going to move one of the dots again, and then test with both `make test` and `make flash_release`.
+
+![bytecode.png](game-boy-advance-development-with-mruby/bytecode.png)
+
+[Link to the code](https://github.com/boatrite/gba-mruby-demo/tree/05-use-ruby-files) / [Link to the diff](https://github.com/boatrite/gba-mruby-demo/compare/04-flash-rom...05-use-ruby-files)
+
+# Port fancier demo to ruby
+
+The last thing I want to do here is port the final demo from the GBA tutorial post over to ruby. I'm not going to paste any of the code here At this point, it all just uses the same basic principles of defining relevant constants and methods in C and binding them to ruby methods.
+
+At this point, I now use the debug flag to open up this console functionality included with the gba libraries for basic testing.
+
+![final_demo.png](game-boy-advance-development-with-mruby/final-demo.png)
+
+![final_debug.png](game-boy-advance-development-with-mruby/final-debug.png)
+
+And of course, here it is running on hardware :)
+
+![hardware_final_demo.mp4](game-boy-advance-development-with-mruby/hardware_final_demo.mp4)
+
+And that's it! If you read this far, I hope it was entertaining! If anyone is inspired to further this and create some mruby GBA roms, I'd love to hear about it! I should probably include some way to get in touch with me :hmm:
+
+[Link to the code](https://github.com/boatrite/gba-mruby-demo/tree/06-port-fancier-demo-to-ruby) / [Link to the diff](https://github.com/boatrite/gba-mruby-demo/compare/05-use-ruby-files...06-port-fancier-demo-to-ruby)
+
+<!-- Markdeep: --><style class="fallback">body{visibility:hidden;white-space:pre;font-family:monospace}</style><script src="markdeep.min.js" charset="utf-8"></script><script src="https://morgan3d.github.io/markdeep/latest/markdeep.min.js" charset="utf-8"></script><script>window.alreadyProcessedMarkdeep||(document.body.style.visibility="visible")</script>
+<script>window.markdeepOptions={"tocStyle": "long"}</script>
